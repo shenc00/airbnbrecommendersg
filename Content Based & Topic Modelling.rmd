@@ -1,0 +1,219 @@
+---
+title: "Recommender system"
+---
+
+```{r setup, include=FALSE}
+library(tm)
+library(tidyr)
+library(RColorBrewer)
+library(wordcloud2)
+library(proxy)
+library(stringr)
+library(slam)
+library(topicmodels)
+library(MASS)
+library(dplyr)
+library(cluster)
+```
+
+
+
+```{r}
+setwd("C:/Users/wbc/Desktop/recommender/Airbnb_data")
+listing = read.csv(file = "listings1.csv", stringsAsFactor=FALSE)
+```
+
+
+# Combine several columns to create content
+```{r}
+content = listing[,c("id","description","neighborhood_overview","transit","access","neighbourhood_cleansed","neighbourhood_group_cleansed")]
+
+content = unite_(content,"desc_all",c("description","neighborhood_overview","transit","access","neighbourhood_cleansed","neighbourhood_group_cleansed"), sep = "_")
+```
+
+
+
+# delete special character,"€"
+```{r}
+content$description = gsub("[^[:alnum:][:space:]']", "",content$desc_all)
+```
+
+
+
+# text cleaning, make corpus
+# Omit null in corpus, because Korean, 
+# Japanese has been translated into "????", 
+# After removing punctuation, these description are deleted.
+```{r}
+corpus = VCorpus(VectorSource(content$desc_all))
+for( i in 1:6){
+  print(corpus[[i]][1])
+} 
+corpus = tm_map(corpus, content_transformer(tolower))
+corpus = tm_map(corpus, removePunctuation)
+corpus = tm_map(corpus, stripWhitespace)
+corpus = tm_map(corpus, removeNumbers)
+corpus = tm_map(corpus, removeWords, stopwords('english'))
+corpus = tm_map(corpus, stemDocument)
+```
+
+
+
+# delete useless words, create dtm 
+```{r}
+my_stopwords = c(stopwords("english"),"walk","room","stop","singapor","singapore","apartment","within","apart",
+                 "will","place","min","minut","road","etc","hrs","check","can","time","area",
+                 "stay","locat","take","one","bed","hour","use","local","need","access","line",
+                 "high","live","guest","just","station","also","hous","provide","region","provid","mins","minutes",
+                 "fulli","servic","away","tabl","quay","veri","centr","via")
+dtm = DocumentTermMatrix(corpus,control = list (stopwords = my_stopwords))
+dtm_ti = weightTfIdf(dtm)
+mat_ti = as.matrix(dtm_ti)
+```
+
+
+#draw wordcloud
+```{r}
+tf = sort(colSums(as.matrix(dtm)), decreasing=TRUE)
+tf = as.data.frame(tf)
+tf$V2 = rownames(tf)
+tf = tf[,c("V2","tf")]
+wordcloud2(tf)
+```
+
+
+
+
+# Algorithm 1
+##distance between different room descriptions, recommend the top 3 shortest distances 
+```{r}
+#calculate similarity between items
+sim_mat_cos = crossprod_simple_triplet_matrix(t(dtm_ti))/(sqrt(col_sums(t(dtm_ti)^2) %*% t(col_sums(t(dtm_ti)^2))))
+
+# create new dataframe
+matrix = matrix(nrow=7907,ncol=6)
+simi_recomd = data.frame(matrix)
+names(simi_recomd) = c("id","item1","item2","item3","item4","item5")
+
+# impute similarity hotel into dataframe, simi_recomd table is the final result we want
+simi_recomd$id = content$id
+
+for(i in c(1:7907)){
+simi_recomd[i,2:6] = content[order(sim_mat_cos[i, ], decreasing = T)[2:6],]$id
+}
+write.csv(simi_recomd, file="F:/simi.csv") 
+
+```
+
+
+
+
+
+# Algorithm 2
+## SVD + clustering
+```{r}
+#svd -- dimension reduction, to create new features(but meaningless)
+dtm_svd = svd(dtm_ti)
+ds = diag(dtm_svd$d[1:3])                    # diag matrix shows the importance of the feature
+plot(1:length(dtm_svd$d), dtm_svd$d)       
+v = dtm_svd$v
+vs = t(as.matrix(v[1:3,]))
+v_dtm_N = data.frame(t(as.matrix(v[1:300,]))) # take top300 as the feature, show new td-idf
+```
+
+
+# split 200 rooms' descriptions to do svd
+```{r}
+dtm_ti = dtm_ti[c(1:1000),]
+dtm_svd = svd(dtm_ti)
+ds = diag(dtm_svd$d[1:3])                    # diag matrix shows the importance of the feature
+plot(1:length(dtm_svd$d), dtm_svd$d) 
+v = dtm_svd$v
+vs = t(as.matrix(v[1:3,]))
+v_dtm_N = data.frame(t(as.matrix(v[1:20,])))
+```
+
+# choose appropriate k to find the smallest sum of error square 
+```{r}
+wssplot = function(data, nc=15, seed=1234){
+    wss = vector() 
+    #wss = (nrow(data)-1)*sum(apply(data,2,var))
+    for (i in 2:nc){
+        set.seed(seed)
+        wss[i] = sum(kmeans(data, centers=i)$withinss)
+        }
+    plot(1:nc, wss, type="b", xlab="Number of Clusters",
+        ylab="Within groups sum of squares")}
+wssplot(v_dtm_N)
+# visualization
+library(factoextra)
+km.res <- kmeans(v_dtm_N,5)
+fviz_cluster(km.res, data = v_dtm_N)
+
+```
+
+
+```{r}
+#clustering for recommendation
+km = kmeans(v_dtm_N,8) # 10 clusters 
+km$cluster
+clusters = as.factor(km$cluster)
+km$size
+table(clusters10)
+y_label=content$id
+cluster_table = data.frame(id = y_label, class = km.10$cluster) # create table, each id has a cluster
+write.csv(cluster_table, file="F:/cluster_recomd.csv")
+```
+
+
+
+
+
+# Algorithm 3
+##LDA + TopicModelling
+
+```{r}
+# use the perplexity to find the appropriate topic number
+perplexity_df = vector()
+topics <- c(2:15)
+burnin = 100
+iter = 1000
+keep = 50  
+
+set.seed(1234)
+for (i in topics){
+ 
+  fitted = LDA(dtm, k = i, method = "Gibbs",
+                control = list(burnin = burnin, iter = iter, keep = keep) )
+  perplexity_df[i] <- perplexity(fitted, newdata = dtm)
+}
+perplexity_df = data.frame(perplexity_df)
+perplexity_df$num = c(1:15)
+ 
+# plot
+library(ggplot2)
+ggplot(perplexity_df, aes(x = num, y = perplexity_df))+geom_line()+geom_point()+
+  labs(x = "Number of topics", y = "Perplexity index", title = "Using perplexity index to find the optimal number of topics")+theme_classic()
+
+```
+
+
+```{r}
+lda_8_g = LDA(dtm, 8, method="Gibbs") # use LDA to construct 8 topics
+
+terms(lda_8_g, 10)   # check the most 8 frequent words occuring words in 8 topics
+
+tabulate(topics(lda_8_g))  # check the number of documents in every topic
+
+t(topics(lda_8_g, 3))[1:20,]  # check the most likely 3 topics for the first 20 documents
+
+topic_dataframe = data.frame(t(topics(lda_8_g, 3))[1:7907,])  # create dataframe for topic result
+names(topic_dataframe) = c("topic1","topic2","topic3","id","prob")
+topic_dataframe$id = content$id
+for (i in c(1:7907)) {
+  topic_dataframe[i,5] = max(lda_8_g@gamma[i,])
+}
+
+write.csv(topic_dataframe, file = "C:/Users/wbc/Desktop/recommender/topic_dataframe.csv")
+```
+
